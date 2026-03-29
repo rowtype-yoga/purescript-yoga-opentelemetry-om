@@ -7,16 +7,21 @@ module Yoga.OpenTelemetry.OpenTelemetryOm
   , setStatus
   , recordException
   , withSpan
+  , withSpanAttrs
+  , SpanCtx
   ) where
 
 import Prelude
 
+import Control.Monad.Error.Class (catchError, throwError)
+import Control.Monad.Reader (local)
+import Data.Maybe (Maybe(..))
 import Effect.Class (liftEffect)
 import Yoga.OpenTelemetry.OpenTelemetry as OTel
 import Type.Row.Homogeneous (class Homogeneous)
 import Yoga.Om as Om
 
--- All tracing functions automatically get tracer from Om context!
+type SpanCtx r = (tracer :: OTel.Tracer, currentSpan :: Maybe OTel.Span | r)
 
 startSpan :: forall r err. String -> Om.Om { tracer :: OTel.Tracer | r } err OTel.Span
 startSpan name = do
@@ -43,10 +48,45 @@ setStatus status span = liftEffect $ OTel.setStatus status span
 recordException :: forall r err. String -> OTel.Span -> Om.Om r err Unit
 recordException error span = liftEffect $ OTel.recordException error span
 
--- Helper: Run an action within a span (automatically ends it)
-withSpan :: forall r err a. String -> Om.Om { tracer :: OTel.Tracer | r } err a -> Om.Om { tracer :: OTel.Tracer | r } err a
+withSpan :: forall r err a. String -> Om.Om { | SpanCtx r } err a -> Om.Om { | SpanCtx r } err a
 withSpan name action = do
-  span <- startSpan name
-  result <- action
-  endSpan span
-  pure result
+  { tracer, currentSpan } <- Om.ask
+  span <- createSpan tracer currentSpan
+  catchError (activate span action <* ok span) (fail span)
+  where
+  createSpan tracer = case _ of
+    Nothing -> OTel.startSpan (OTel.SpanName name) tracer # liftEffect
+    Just parent -> OTel.startChildSpan (OTel.SpanName name) parent tracer # liftEffect
+  activate span = local (_ { currentSpan = Just span })
+  ok span = liftEffect do
+    OTel.setStatus OTel.StatusOk span
+    OTel.endSpan span
+  fail span err = do
+    liftEffect do
+      OTel.recordException name span
+      OTel.setStatus OTel.StatusError span
+      OTel.endSpan span
+    throwError err
+
+withSpanAttrs :: forall r attrs err a. Homogeneous attrs OTel.AttributeValue => String -> { | attrs } -> Om.Om { | SpanCtx r } err a -> Om.Om { | SpanCtx r } err a
+withSpanAttrs name attrs action = do
+  { tracer, currentSpan } <- Om.ask
+  span <- createSpan tracer currentSpan
+  catchError (activate span action <* ok span) (fail span)
+  where
+  createSpan tracer parent = liftEffect do
+    span <- case parent of
+      Nothing -> OTel.startSpan (OTel.SpanName name) tracer
+      Just p -> OTel.startChildSpan (OTel.SpanName name) p tracer
+    OTel.setAttributes attrs span
+    pure span
+  activate span = local (_ { currentSpan = Just span })
+  ok span = liftEffect do
+    OTel.setStatus OTel.StatusOk span
+    OTel.endSpan span
+  fail span err = do
+    liftEffect do
+      OTel.recordException name span
+      OTel.setStatus OTel.StatusError span
+      OTel.endSpan span
+    throwError err
